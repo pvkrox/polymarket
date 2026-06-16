@@ -24,8 +24,8 @@ def fetch_markets():
 def get_ai_summary(question, outcomes, prices):
     try:
         payload = {
-            "model": "claude-sonnet-4-6",
-            "max_tokens": 1000,
+            "model": "llama-3.3-70b-versatile",
+            "max_tokens": 500,
             "messages": [{
                 "role": "user",
                 "content": f"""You are a prediction market analyst. Summarize this market in 3 bullet points:
@@ -40,12 +40,14 @@ Be concise, sharp, no fluff."""
             }]
         }
         r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {st.secrets['GROQ_API_KEY']}"
+            },
             json=payload
         )
-        data = r.json()
-        return data["content"][0]["text"]
+        return r.json()["choices"][0]["message"]["content"]
     except Exception as e:
         return f"Could not load summary: {e}"
 
