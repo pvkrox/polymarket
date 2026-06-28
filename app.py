@@ -3,17 +3,43 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 import json
+from supabase import create_client
 
 st.set_page_config(page_title="Polymarket Browser", layout="wide")
 st.title("Polymarket Market Browser")
 
+# ── Supabase client ─────────────────────────────────────────────────
+@st.cache_resource
+def get_supabase():
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_KEY"]
+    )
+
+supabase = get_supabase()
+
+# ── Persistent price history helpers ────────────────────────────────
+def load_price_history(market_id):
+    res = supabase.table("price_history") \
+        .select("prices, time") \
+        .eq("market_id", market_id) \
+        .order("time", desc=False) \
+        .limit(10) \
+        .execute()
+    return res.data  # list of {prices, time}
+
+def save_price_snapshot(market_id, prices):
+    supabase.table("price_history").insert({
+        "market_id": market_id,
+        "prices": prices,
+        "time": datetime.now(timezone.utc).isoformat()
+    }).execute()
+
 # ── Session state init ──────────────────────────────────────────────
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = {}  # {id: market_row_dict}
-if "price_history" not in st.session_state:
-    st.session_state.price_history = {}  # {id: [{"time": ..., "prices": ...}]}
+    st.session_state.watchlist = {}
 
-# ── Fetch ───────────────────────────────────────────────────────────
+# ── Fetch markets ───────────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_markets():
     url = "https://gamma-api.polymarket.com/markets"
@@ -66,7 +92,7 @@ df["closing_soon"] = df["endDate"].apply(
     lambda x: pd.notna(x) and 0 <= (x - now).days <= 7
 )
 
-# ── Sidebar: Watchlist (L4) ─────────────────────────────────────────
+# ── Sidebar: Watchlist ──────────────────────────────────────────────
 with st.sidebar:
     st.header("⭐ Watchlist")
     if st.session_state.watchlist:
@@ -100,7 +126,7 @@ elif sort_by == "Closing Later":
 
 st.write(f"Showing {len(df)} markets")
 
-# ── Market cards ─────────────────────────────────────────────────────
+# ── Market cards ────────────────────────────────────────────────────
 for i, row in df.iterrows():
     label = ("🔴 " if row["closing_soon"] else "") + row["question"]
     with st.expander(label):
@@ -113,28 +139,30 @@ for i, row in df.iterrows():
                 prob = p * 100
                 st.progress(int(prob), text=f"{o}: {prob:.1f}%")
 
-            # L5 — Price movement tracker
+            # Price movement tracker — persistent via Supabase
             mid = str(row.get("id", i))
-            history = st.session_state.price_history.get(mid, [])
+            history = load_price_history(mid)
+
             if history:
-                last_prices = history[-1]["prices"]
-                st.write("**Price movement since last check:**")
+                last_entry = history[-1]
+                last_prices = last_entry["prices"]
+                last_time = last_entry["time"][:16].replace("T", " ")
+                st.write(f"**Price movement since {last_time} UTC:**")
                 for o, p_now, p_last in zip(outcomes, price_floats, last_prices):
                     delta = (p_now - p_last) * 100
                     arrow = "🟢 +" if delta > 0 else ("🔴 " if delta < 0 else "⚪ ")
                     st.write(f"{o}: {arrow}{delta:+.1f}%")
-            
-            # Save snapshot to history
-            st.session_state.price_history[mid] = history + [{
-                "time": now.isoformat(),
-                "prices": price_floats
-            }]
-            if len(st.session_state.price_history[mid]) > 10:
-                st.session_state.price_history[mid] = st.session_state.price_history[mid][-10:]
 
-        except:
+                # Only save if prices changed
+                if last_prices != price_floats:
+                    save_price_snapshot(mid, price_floats)
+            else:
+                st.caption("First visit — check back later to see price movement.")
+                save_price_snapshot(mid, price_floats)
+
+        except Exception as e:
             st.write("Prices:", row.get("outcomePrices", "N/A"))
-            outcomes, prices = [], []
+            outcomes, price_floats = [], []
 
         st.metric("Volume", f"${float(row['volume']):,.0f}")
         end = row.get("endDate")
@@ -142,7 +170,7 @@ for i, row in df.iterrows():
             days_left = (end - now).days
             st.write(f"Ends: {end.strftime('%b %d, %Y')} ({days_left} days left)")
 
-        # L4 — Watchlist button
+        # Watchlist
         mid = str(row.get("id", i))
         if mid in st.session_state.watchlist:
             if st.button("⭐ Remove from Watchlist", key=f"w_{i}"):
@@ -153,11 +181,11 @@ for i, row in df.iterrows():
                 st.session_state.watchlist[mid] = row.to_dict()
                 st.rerun()
 
-        # L6 — AI Summary
+        # AI Summary
         if st.button("🤖 AI Summary", key=f"ai_{i}"):
             with st.spinner("Analyzing..."):
                 try:
-                    summary = get_ai_summary(row["question"], outcomes, prices)
+                    summary = get_ai_summary(row["question"], outcomes, price_floats)
                     st.markdown(summary)
                 except:
                     st.write("Could not load summary.")
